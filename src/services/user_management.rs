@@ -26,7 +26,6 @@ use crate::{
     services::{
         audit_logger::{AuditEvent, AuditLogger},
         auth::RequestContext,
-        credential::CredentialService,
         database::Database,
         rbac::RBACService,
     },
@@ -34,45 +33,22 @@ use crate::{
 
 pub struct UserManagementService {
     db: Arc<Database>,
-    /// 回答响应里的 `has_password`。口令不在账户行上，所以这个字段只能问凭证。
-    credentials: CredentialService,
 }
 
 impl UserManagementService {
-    /// 会员等级是一个**不透明标签**：存下来、原样交回，不解释。
-    ///
-    /// 这里原先把五个具体档位名硬编码成一个 match 分支 —— 那是某个产品的定价
-    /// 表，不是认证服务该知道的事实。后果有两层：接入方想加一个档位就得改
-    /// SoulAuth 并重新部署；而更根本的是，它把商业状态写进了认证内核的判断
-    /// 逻辑里（`a8` 断言禁止的正是这件事）。
-    ///
-    /// 现在只校验形状：大写、限长、限字符集 —— 足以挡住把整段 JSON 或一句 SQL
-    /// 塞进这个字段，而档位词汇表归拥有计费的那个系统。
     fn normalize_membership_level(level: &str) -> Result<String, AuthError> {
-        let normalized = level.trim().to_ascii_uppercase();
-
-        if normalized.is_empty() || normalized.len() > 32 {
-            return Err(AuthError::ValidationError(
-                "Membership level must be 1 to 32 characters".to_string(),
-            ));
+        match level.trim().to_ascii_uppercase().as_str() {
+            "FREE" | "PRO" | "PREMIUM" | "ULTIMATE" | "TEAM" => {
+                Ok(level.trim().to_ascii_uppercase())
+            }
+            _ => Err(AuthError::ValidationError(
+                "Invalid membership level".to_string(),
+            )),
         }
-        if !normalized
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-        {
-            return Err(AuthError::ValidationError(
-                "Membership level may contain only letters, digits, `_` and `-`".to_string(),
-            ));
-        }
-
-        Ok(normalized)
     }
 
     pub fn new(db: Arc<Database>) -> Self {
-        Self {
-            credentials: CredentialService::new(db.clone()),
-            db,
-        }
+        Self { db }
     }
 
     // 用户档案管理
@@ -88,17 +64,12 @@ impl UserManagementService {
         // 检查用户是否存在
         let mut response = self
             .db
-            .client
-            // `user_thing` 自 Stage 3 起是**身份根**引用，不能拿它去 user 表查 ——
-            // 那必然查不到，于是建资料返回 404。存在性判定改查 actor_identity。
-            // `SELECT VALUE id` 而不是 `SELECT *`：整行里有 record 类型字段，
-            // 用 serde_json::Value 接会报「Expected any, got record」。
-            // 这里只需要判断有没有这一行，取 id 就够。
-            .query("SELECT VALUE id FROM actor_identity WHERE id = $user_id LIMIT 1")
-            .bind(("user_id", user_thing.clone()))
-            .await
-            .and_then(|response| response.check())
-            .map_err(|e| {
+            .raw_query(
+                "user_profile.check_actor_identity",
+                "SELECT VALUE id FROM actor_identity WHERE id = $user_id LIMIT 1",
+                serde_json::json!({ "user_id": user_thing.clone() }),
+            )
+            .await.map_err(|e| {
                 error!("Failed to check user existence: {}", e);
                 AuthError::DatabaseError(e.to_string())
             })?;
@@ -125,7 +96,7 @@ impl UserManagementService {
         let now = Utc::now().timestamp();
         let profile = UserProfile {
             id: None,
-            actor_identity_id: user_thing,
+            user_id: user_thing,
             first_name: request.first_name,
             last_name: request.last_name,
             display_name: request.display_name,
@@ -144,12 +115,12 @@ impl UserManagementService {
         let query = "CREATE user_profile CONTENT $profile";
         let mut response = self
             .db
-            .client
-            .query(query)
-            .bind(("profile", profile.clone()))
-            .await
-            .and_then(|response| response.check())
-            .map_err(|e| {
+            .raw_query(
+                "user_profile.create",
+                query,
+                serde_json::json!({ "profile": profile.clone() }),
+            )
+            .await.map_err(|e| {
                 error!("Failed to create user profile: {}", e);
                 AuthError::DatabaseError(e.to_string())
             })?;
@@ -185,15 +156,15 @@ impl UserManagementService {
         // profile / preferences 挂在**身份根**上（Stage 3 起外键指 actor_identity）。
         let user_thing = self.db.actor_ref_of_user(user_id).await?;
 
-        let query = "SELECT * FROM user_profile WHERE actor_identity_id = $actor_identity_id";
+        let query = "SELECT * FROM user_profile WHERE user_id = $user_id";
         let mut response = self
             .db
-            .client
-            .query(query)
-            .bind(("actor_identity_id", user_thing.clone()))
-            .await
-            .and_then(|response| response.check())
-            .map_err(|e| {
+            .raw_query(
+                "user_profile.get",
+                query,
+                serde_json::json!({ "user_id": user_thing.clone() }),
+            )
+            .await.map_err(|e| {
                 error!("Failed to get user profile: {}", e);
                 AuthError::DatabaseError(e.to_string())
             })?;
@@ -243,7 +214,7 @@ impl UserManagementService {
                 website = $website ?? website,
                 location = $location ?? location,
                 updated_at = $updated_at
-            WHERE actor_identity_id = (SELECT VALUE subject_id FROM type::record('user', $user_key))[0]
+            WHERE user_id = (SELECT VALUE subject_id FROM type::record('user', $user_key))[0]
         "#;
 
         let bindings = serde_json::json!({
@@ -354,12 +325,12 @@ impl UserManagementService {
         let query = "CREATE user_preferences CONTENT $preferences";
         let mut response = self
             .db
-            .client
-            .query(query)
-            .bind(("preferences", preferences.clone()))
-            .await
-            .and_then(|response| response.check())
-            .map_err(|e| {
+            .raw_query(
+                "user_preferences.create",
+                query,
+                serde_json::json!({ "preferences": preferences.clone() }),
+            )
+            .await.map_err(|e| {
                 error!("Failed to create user preferences: {}", e);
                 AuthError::DatabaseError(e.to_string())
             })?;
@@ -401,12 +372,12 @@ impl UserManagementService {
         let query = "SELECT * FROM user_preferences WHERE user_id = $user_id";
         let mut response = self
             .db
-            .client
-            .query(query)
-            .bind(("user_id", user_thing.clone()))
-            .await
-            .and_then(|response| response.check())
-            .map_err(|e| {
+            .raw_query(
+                "user_preferences.get",
+                query,
+                serde_json::json!({ "user_id": user_thing.clone() }),
+            )
+            .await.map_err(|e| {
                 error!("Failed to get user preferences: {}", e);
                 AuthError::DatabaseError(e.to_string())
             })?;
@@ -513,12 +484,12 @@ impl UserManagementService {
         // 检查用户是否存在
         let mut response = self
             .db
-            .client
-            .query("SELECT * FROM user WHERE id = $user_id LIMIT 1")
-            .bind(("user_id", user_thing.clone()))
-            .await
-            .and_then(|response| response.check())
-            .map_err(|e| {
+            .raw_query(
+                "user_management.check_user_exists",
+                "SELECT * FROM user WHERE id = $user_id LIMIT 1",
+                serde_json::json!({ "user_id": user_thing.clone() }),
+            )
+            .await.map_err(|e| {
                 error!("Failed to check user existence: {}", e);
                 AuthError::DatabaseError(e.to_string())
             })?;
@@ -534,14 +505,17 @@ impl UserManagementService {
 
         let now = Utc::now();
 
-        self.db.client
-            .query("UPDATE user SET account_status = $status, updated_at = $updated_at WHERE id = $user_id")
-            .bind(("status", request.status.to_string()))
-            .bind(("updated_at", now.timestamp()))
-            .bind(("user_id", user_thing.clone()))
-            .await
-            .and_then(|response| response.check())
-            .map_err(|e| {
+        self.db
+            .raw_query(
+                "user_management.update_account_status",
+                "UPDATE user SET account_status = $status, updated_at = $updated_at WHERE id = $user_id",
+                serde_json::json!({
+                    "status": request.status.to_string(),
+                    "updated_at": now.timestamp(),
+                    "user_id": user_thing.clone(),
+                }),
+            )
+            .await.map_err(|e| {
                 error!("Failed to update account status: {}", e);
                 AuthError::DatabaseError(e.to_string())
             })?;
@@ -585,22 +559,6 @@ impl UserManagementService {
                 // 都留给 Stage 3 的迁移处理。
                 Ok(None) => {}
                 Err(e) => error!("Failed to load actor for status sync: {e:?}"),
-            }
-
-            // 账号被删除时吊销口令凭证。
-            //
-            // 只在 `Deleted` 上做，不在 `Suspended` 上做：停用是可逆的，恢复之后
-            // 用户应当还能用原来的口令登录；而删除不可逆，那把凭证不该继续可用。
-            //
-            // 吊销是改状态而不是删行 —— 「这把凭证曾经存在且被吊销了」与
-            // 「从来没有过」是两个不同的事实。
-            if request.status == crate::models::user::AccountStatus::Deleted {
-                if let Err(e) = self.credentials.revoke_password(&actor_id).await {
-                    // 与上面同样的道理：账户状态已经写成 Deleted，凭证还可用，
-                    // 两处不一致比两处都是旧的更危险。
-                    error!("Failed to revoke password credential on delete: {e:?}");
-                    return Err(e);
-                }
             }
         }
 
@@ -656,12 +614,7 @@ impl UserManagementService {
         user_agent: &str,
         details: serde_json::Value,
     ) -> Result<(), AuthError> {
-        // 用进程内那个唯一的 logger，不要现造：`AuditLogger::start` 会 spawn
-        // 一个写入任务并维护链头，每条事件造一个等于每条事件一条链。
-        let Some(audit) = AuditLogger::global() else {
-            return Ok(());
-        };
-        audit.record(
+        AuditLogger::new(self.db.clone()).record(
             AuditEvent::new(action, category, status, ip_address, user_agent)
                 .with_user(user_id)
                 .with_details(details),
@@ -688,7 +641,7 @@ impl UserManagementService {
         let offset = (page - 1).saturating_mul(limit);
 
         let mut where_clauses = vec![
-            "actor_identity_id = (SELECT VALUE subject_id FROM type::record('user', $user_key))[0]"
+            "user_id = (SELECT VALUE subject_id FROM type::record('user', $user_key))[0]"
                 .to_string(),
         ];
         if request.category.is_some() {
@@ -796,22 +749,9 @@ impl UserManagementService {
             .next()
             .ok_or_else(|| AuthError::NotFound("User not found".to_string()))?;
 
-        let has_password = self.has_password_for(&user).await?;
-        let mut response = UserResponse::of(user, has_password);
+        let mut response: UserResponse = user.into();
         response.is_admin = self.user_has_admin_role(user_id).await?;
         Ok(response)
-    }
-
-    /// 单个账户行的 `has_password`。
-    ///
-    /// 没有身份根的账户行（Stage 3 迁移之前的遗留）一律按「没有口令」处理：
-    /// 它的凭证无从查起，而把一个查不到的东西报成 `true` 会让前端隐藏设置
-    /// 口令的入口。
-    async fn has_password_for(&self, user: &User) -> Result<bool, AuthError> {
-        match user.subject_id.as_ref() {
-            Some(actor) => self.credentials.has_password(actor).await,
-            None => Ok(false),
-        }
     }
 
     async fn user_has_admin_role(&self, user_id: &str) -> Result<bool, AuthError> {
@@ -899,20 +839,6 @@ impl UserManagementService {
 
         let total_pages = (total as f64 / limit as f64).ceil() as u32;
 
-        // 一次问清这一页里谁有可用口令。
-        //
-        // 逐行查是 N+1：一页 50 个用户就是 50 次往返，而这个字段只是用来决定
-        // 前端显示「设置口令」还是「修改口令」。
-        let actor_keys: Vec<String> = users
-            .iter()
-            .filter_map(|u| u.subject_id.as_ref())
-            .map(crate::utils::record_id::record_id_key_to_string)
-            .collect();
-        let with_password = self
-            .credentials
-            .identities_with_password(&actor_keys)
-            .await?;
-
         let mut user_responses = Vec::with_capacity(users.len());
         for user in users {
             let user_id = crate::utils::record_id::record_id_key_to_string(
@@ -920,18 +846,7 @@ impl UserManagementService {
                     .as_ref()
                     .ok_or_else(|| AuthError::DatabaseError("User missing id".to_string()))?,
             );
-            let has_password = user
-                .subject_id
-                .as_ref()
-                .map(|a| {
-                    let addr = format!(
-                        "actor_identity:{}",
-                        crate::utils::record_id::record_id_key_to_string(a)
-                    );
-                    with_password.contains(&addr)
-                })
-                .unwrap_or(false);
-            let mut response = UserResponse::of(user, has_password);
+            let mut response: UserResponse = user.into();
             response.is_admin = self.user_has_admin_role(&user_id).await?;
             user_responses.push(response);
         }
@@ -985,8 +900,7 @@ impl UserManagementService {
                 .as_ref()
                 .ok_or_else(|| AuthError::DatabaseError("Updated user missing id".to_string()))?,
         );
-        let has_password = self.has_password_for(&updated).await?;
-        let mut response = UserResponse::of(updated, has_password);
+        let mut response: UserResponse = updated.into();
         response.is_admin = self.user_has_admin_role(&updated_id).await?;
         Ok(response)
     }
